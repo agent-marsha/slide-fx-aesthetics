@@ -54,6 +54,17 @@
   .count{font-size:12.5px;letter-spacing:.14em;color:var(--muted);font-weight:700}
   .count b{color:var(--accent)}
   .hint{position:absolute;left:58px;bottom:16px;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:#9AA1A8;z-index:20}
+  @media print{
+    @page{size:1280px 720px;margin:0}
+    html,body{height:auto!important;overflow:visible!important;background:#fff}
+    body{display:block}
+    #stage{transform:none!important;width:1280px!important;height:auto!important;box-shadow:none}
+    .slide{position:relative!important;inset:auto;display:flex!important;width:1280px;height:720px;
+      break-after:page;page-break-after:always}
+    .fx-bg{position:absolute!important;inset:0;opacity:.55}
+    .progress,.nav,.hint{display:none!important}
+    *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  }
   @media (max-width:820px){
     html,body{height:auto;overflow-y:auto}body{display:block}
     #stage{width:100%;height:auto;transform:none!important;box-shadow:none}
@@ -1467,8 +1478,14 @@ void main(void)\r
     };
 
     function resize() {
+      if (scene._frozen) return;          /* frozen = keep the current frame (PDF export) */
       var r = canvas.getBoundingClientRect();
-      W = Math.max(1, Math.round(r.width)); H = Math.max(1, Math.round(r.height));
+      var w = Math.round(r.width), h = Math.round(r.height);
+      /* A hidden slide (display:none) collapses the canvas to 0x0. Assigning canvas.width
+         CLEARS the canvas, so without this guard navigating away would wipe the frame —
+         and every warm canvas would print blank. Keep the last good buffer instead. */
+      if (w < 20 || h < 20) return;
+      W = Math.max(1, w); H = Math.max(1, h);
       canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
       if (scene.onResize) scene.onResize(W, H);
     }
@@ -1537,6 +1554,10 @@ void main(void)\r
       scene._raf = global.requestAnimationFrame(step);
     };
     scene.stop = function () { scene.running = false; if (scene._raf) global.cancelAnimationFrame(scene._raf); };
+    /* freeze: stop and ignore ResizeObserver — resizing assigns canvas.width, which CLEARS the
+       canvas. Exporters call this after warming so the printed page keeps the rendered frame. */
+    scene.freeze = function () { scene._frozen = true; scene.stop(); };
+    scene.unfreeze = function () { scene._frozen = false; };
     scene.restart = function () { scene.stop(); scene.t = 0; scene._cur = null; scene._queue = scene._queue.slice(); resize(); scene.start(); };
 
     if (global.ResizeObserver) { new ResizeObserver(function () { resize(); }).observe(canvas); }
@@ -1623,6 +1644,7 @@ void main(void)\r
     }
     global.addEventListener('resize', tick);
     tick();
+    FX.mounts = mounts;          /* exposed so exporters can freeze every scene   */
     return mounts;
   };
 
@@ -2054,7 +2076,13 @@ void main(void)\r
     s.build(function (sc, M) {
       var W = sc.width(), H = sc.height();
       var rows = opts.rows || 10;
-      var top = H * 0.14, gapY = H * 0.055;
+      /* lay the board out from the BOTTOM up: reserve a real bin area first, then fit the peg
+         lattice into the space above it. Sizing the bins as an afterthought leaves them too
+         shallow and the pile just spills across the floor. */
+      var top = H * 0.10;
+      var floorY = H * 0.94;
+      var binH = Math.min(H * 0.30, 150);
+      var gapY = Math.max(12, (floorY - binH - top) / rows);
       var gapX = Math.min(gapY * 1.25, W * 0.062);
       var pegR = 3.2, ballR = 4.6;
       var r, c, n, x, y;
@@ -2067,27 +2095,61 @@ void main(void)\r
             { isStatic: true, restitution: 0.42, friction: 0, _peg: true }));
         }
       }
-      var floorY = top + rows * gapY + ballR * 3;
       var bins = rows + 1;
       sc.walls(20, 0.05);
-      // floor + bin dividers
+      // floor + bin dividers spanning the full reserved bin height
       M.Composite.add(sc.world, M.Bodies.rectangle(W / 2, floorY, W, 12, { isStatic: true, _wall: true, friction: 0.4 }));
       for (c = 0; c <= bins; c++) {
         x = W / 2 + (c - bins / 2) * gapX;
-        M.Composite.add(sc.world, M.Bodies.rectangle(x, floorY - ballR * 9, 2.5, ballR * 18,
+        M.Composite.add(sc.world, M.Bodies.rectangle(x, floorY - binH / 2, 2.5, binH,
           { isStatic: true, _divider: true }));
       }
       var live = [], acc = 0, life = 0;
+
+      /* Pre-seed the mound (binomial, p=0.5) so the board reads as a Galton board the moment
+         the slide opens — and so any single-frame capture (PDF export) shows the distribution
+         rather than an empty board. */
+      function binom(n2, k2) { var r2 = 1; for (var i2 = 0; i2 < k2; i2++) r2 = r2 * (n2 - i2) / (i2 + 1); return r2; }
+      var dist = [], dsum = 0, kk, floorTop = floorY - 6;   // floor slab is 12 tall, centred on floorY
+      for (c = 0; c < bins; c++) { var d = binom(rows, c); dist.push(d); dsum += d; }
+      var perLayer = Math.max(1, Math.floor(gapX / (ballR * 2.1)));   // balls that fit across a bin
+      for (c = 0; c < bins; c++) {
+        var cnt = Math.round(165 * dist[c] / dsum);
+        var left = W / 2 + (c - bins / 2) * gapX;                     // bin's left edge
+        var placed = 0;
+        /* Nest layer-by-layer (not one tall column per bin): a single column topples and
+           flattens out, whereas nested layers settle into the mound you expect. */
+        for (var L = 0; placed < cnt; L++) {
+          var by = floorTop - ballR - L * (ballR * 2.1) - 1;
+          if (by < floorTop - binH + ballR + 2) break;                // stay inside the bin height
+          for (var p2 = 0; p2 < perLayer && placed < cnt; p2++, placed++) {
+            var bx = left + (p2 + 0.5) * (gapX / perLayer);
+            var sb = M.Bodies.circle(bx, by, ballR,
+              { restitution: 0.02, friction: 0.8, frictionAir: 0.05, density: 0.0025 });
+            M.Composite.add(sc.world, sb); live.push(sb);
+          }
+        }
+      }
+
+      var seedCount = live.length;          // the mound is permanent; only spawned balls cycle
+
       function spawn() {
         var b = M.Bodies.circle(W / 2 + (Math.random() - 0.5) * 8, top - 34, ballR,
           { restitution: 0.26, friction: 0.22, frictionAir: 0.014, density: 0.0025 });
         M.Composite.add(sc.world, b); live.push(b);
-        if (live.length > 95) { var old = live.shift(); M.Composite.remove(sc.world, old); }
+        if (live.length > seedCount + 55) {
+          var old = live.splice(seedCount, 1)[0];      // evict an older *spawned* ball
+          M.Composite.remove(sc.world, old);
+        }
       }
       sc.update(function (dt) {
         acc += dt; life += dt;
         if (acc > 0.34) { acc = 0; spawn(); }
-        if (life > 40) { life = 0; live.forEach(function (b) { M.Composite.remove(sc.world, b); }); live.length = 0; }
+        if (life > 40) {
+          life = 0;
+          live.slice(seedCount).forEach(function (b) { M.Composite.remove(sc.world, b); });
+          live.length = seedCount;                     // keep the seeded mound
+        }
       });
       sc.drawBodies(function (b) {
         if (b._peg) return { fill: 'rgba(90,98,107,0.55)', stroke: false };
@@ -2296,7 +2358,7 @@ void main(void)\r
         scene._objects.length = 0; scene._sim.length = 0; scene.t = 0;
         fn(scene, g, B);
       };
-      scene.resize = function () { if (scene.onResize) scene.onResize(); else B.setSize(scene.width(), scene.height()); };
+      scene.resize = function () { if (scene._frozen) return; if (scene.onResize) scene.onResize(); else B.setSize(scene.width(), scene.height()); };
       if (scene.width() >= 20) scene.onResize();
       return scene;
     };
@@ -2315,6 +2377,9 @@ void main(void)\r
     }
     scene.start = function () { if (scene.running) return; scene.running = true; scene._last = 0; scene._raf = global.requestAnimationFrame(step); };
     scene.stop = function () { scene.running = false; if (scene._raf) global.cancelAnimationFrame(scene._raf); };
+    /* freeze for export: stop and ignore resize (a resize would clear the frame) */
+    scene.freeze = function () { scene._frozen = true; scene.stop(); };
+    scene.unfreeze = function () { scene._frozen = false; };
     if (global.ResizeObserver) { new ResizeObserver(function () { scene.resize(); }).observe(canvas); }
     return scene;
   };
